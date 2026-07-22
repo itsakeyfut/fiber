@@ -412,3 +412,57 @@ test "local variables survive across yields" {
     // a=13, b=25, c=37 -> 13000 + 2500 + 37
     try std.testing.expectEqual(@as(u64, 15537), S.result);
 }
+
+test "independent fibers keep separate state when interleaved" {
+    const allocator = std.testing.allocator;
+
+    const S = struct {
+        var counters = [_]u64{ 0, 0, 0 };
+        // Three sibling entries, one per fiber. Each references `counters`
+        // unqualified (a sibling container var), avoiding a self-reference to
+        // the local `S` from a nested struct, which does not compile.
+        fn w0(_: *Fiber) void {
+            var i: usize = 0;
+            while (i < 3) : (i += 1) {
+                counters[0] += 1;
+                Fiber.yield();
+            }
+        }
+        fn w1(_: *Fiber) void {
+            var i: usize = 0;
+            while (i < 5) : (i += 1) {
+                counters[1] += 1;
+                Fiber.yield();
+            }
+        }
+        fn w2(_: *Fiber) void {
+            var i: usize = 0;
+            while (i < 2) : (i += 1) {
+                counters[2] += 1;
+                Fiber.yield();
+            }
+        }
+    };
+    S.counters = .{ 0, 0, 0 };
+
+    const fibers = [_]*Fiber{
+        try Fiber.create(allocator, &S.w0),
+        try Fiber.create(allocator, &S.w1),
+        try Fiber.create(allocator, &S.w2),
+    };
+    defer for (fibers) |f| f.destroy();
+
+    var remaining: usize = fibers.len;
+    while (remaining > 0) {
+        remaining = 0;
+        for (fibers) |f| {
+            if (f.state == .done) continue;
+            f.resumeFiber();
+            if (f.state != .done) remaining += 1;
+        }
+    }
+
+    try std.testing.expectEqual(@as(u64, 3), S.counters[0]);
+    try std.testing.expectEqual(@as(u64, 5), S.counters[1]);
+    try std.testing.expectEqual(@as(u64, 2), S.counters[2]);
+}
