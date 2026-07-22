@@ -1,5 +1,6 @@
 # fiber
 
+[![CI](https://github.com/itsakeyfut/fiber/actions/workflows/ci.yml/badge.svg)](https://github.com/itsakeyfut/fiber/actions/workflows/ci.yml)
 [![Zig](https://img.shields.io/badge/zig-0.16.0-orange.svg)](https://ziglang.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
@@ -78,10 +79,11 @@ pub fn main() !void {
 }
 ```
 
-A runnable version lives in [`src/main.zig`](src/main.zig):
+Runnable, expanded versions live in [`examples/`](examples/) — a single-fiber
+walkthrough and a small cooperative scheduler over several fibers:
 
 ```sh
-zig build run
+zig build examples
 ```
 
 ## API
