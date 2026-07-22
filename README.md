@@ -78,10 +78,11 @@ pub fn main() !void {
 }
 ```
 
-A runnable version lives in [`src/main.zig`](src/main.zig):
+Runnable, expanded versions live in [`examples/`](examples/) — a single-fiber
+walkthrough and a small cooperative scheduler over several fibers:
 
 ```sh
-zig build run
+zig build examples
 ```
 
 ## API

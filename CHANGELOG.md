@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `examples/basic.zig` and `examples/scheduler.zig`, runnable via
+  `zig build examples`.
+
+### Removed
+
+- `src/main.zig`; the demo now lives under `examples/`.
+
 ## [0.1.0] - 2026-07-22
 
 Initial release.
