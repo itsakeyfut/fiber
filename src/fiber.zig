@@ -48,6 +48,18 @@ pub const Fiber = struct {
         return self;
     }
 
+    /// Re-arm a finished (or never-started) fiber with a new entry and data,
+    /// reusing the existing stack allocation. This is the pooling primitive:
+    /// create a pool of fibers once, then `reset` each between jobs instead of
+    /// reallocating a stack per job.
+    pub fn reset(self: *Fiber, entry: *const fn (*Fiber) void, data: ?*anyopaque) void {
+        std.debug.assert(self.state == .done or self.state == .ready);
+        self.entry = entry;
+        self.data = data;
+        self.state = .ready;
+        self.setupStack();
+    }
+
     pub fn destroy(self: *Fiber) void {
         const allocator = self.allocator;
         allocator.free(self.stack);
@@ -558,4 +570,40 @@ test "custom stack size is honored" {
 
     while (f.state != .done) f.resumeFiber();
     try std.testing.expect(S.ran);
+}
+
+test "reset re-arms a finished fiber for reuse without reallocating" {
+    const allocator = std.testing.allocator;
+
+    const S = struct {
+        var first_ran: u32 = 0;
+        fn first(_: *Fiber) void {
+            first_ran += 1;
+        }
+        fn second(f: *Fiber) void {
+            const n: *u32 = @ptrCast(@alignCast(f.data.?));
+            n.* += 10;
+        }
+    };
+    S.first_ran = 0;
+
+    const f = try Fiber.create(allocator, &S.first, .{});
+    defer f.destroy();
+
+    const stack_ptr = f.stack.ptr;
+    const stack_len = f.stack.len;
+
+    while (f.state != .done) f.resumeFiber();
+    try std.testing.expectEqual(@as(u32, 1), S.first_ran);
+    try std.testing.expectEqual(State.done, f.state);
+
+    // Re-arm the same fiber with a new entry + data; same stack buffer.
+    var counter: u32 = 5;
+    f.reset(&S.second, &counter);
+    try std.testing.expectEqual(State.ready, f.state);
+    try std.testing.expectEqual(stack_ptr, f.stack.ptr); // no realloc
+    try std.testing.expectEqual(stack_len, f.stack.len);
+
+    while (f.state != .done) f.resumeFiber();
+    try std.testing.expectEqual(@as(u32, 15), counter);
 }
