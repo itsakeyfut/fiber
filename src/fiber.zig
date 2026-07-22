@@ -321,3 +321,94 @@ test "a fiber can resume another fiber (nesting)" {
     try std.testing.expectEqual(State.done, inner.state);
     try std.testing.expectEqual(State.done, outer.state);
 }
+
+test "yield works from deep in the call stack" {
+    const allocator = std.testing.allocator;
+
+    const S = struct {
+        var reached: usize = 0;
+        var resumed: usize = 0;
+        fn recurse(depth: usize) void {
+            if (depth == 0) {
+                reached = 100;
+                Fiber.yield();
+                resumed = 200;
+                return;
+            }
+            recurse(depth - 1);
+        }
+        fn work(_: *Fiber) void {
+            recurse(100);
+        }
+    };
+    S.reached = 0;
+    S.resumed = 0;
+
+    const f = try Fiber.create(allocator, &S.work);
+    defer f.destroy();
+
+    f.resumeFiber(); // descends 100 frames, then yields
+    try std.testing.expectEqual(@as(usize, 100), S.reached);
+    try std.testing.expectEqual(@as(usize, 0), S.resumed);
+    try std.testing.expectEqual(State.suspended, f.state);
+
+    f.resumeFiber(); // continues from deep in the stack to completion
+    try std.testing.expectEqual(@as(usize, 200), S.resumed);
+    try std.testing.expectEqual(State.done, f.state);
+}
+
+test "a fiber can yield many times" {
+    const allocator = std.testing.allocator;
+
+    const S = struct {
+        var count: usize = 0;
+        fn work(_: *Fiber) void {
+            var i: usize = 0;
+            while (i < 10_000) : (i += 1) {
+                count += 1;
+                Fiber.yield();
+            }
+        }
+    };
+    S.count = 0;
+
+    const f = try Fiber.create(allocator, &S.work);
+    defer f.destroy();
+
+    var resumes: usize = 0;
+    while (f.state != .done) {
+        f.resumeFiber();
+        resumes += 1;
+    }
+
+    try std.testing.expectEqual(@as(usize, 10_000), S.count);
+    try std.testing.expectEqual(@as(usize, 10_001), resumes);
+}
+
+test "local variables survive across yields" {
+    const allocator = std.testing.allocator;
+
+    const S = struct {
+        var result: u64 = 0;
+        fn work(_: *Fiber) void {
+            var a: u64 = 3;
+            var b: u64 = 5;
+            var c: u64 = 7;
+            Fiber.yield();
+            a += 10;
+            b += 20;
+            Fiber.yield();
+            c += 30;
+            result = a * 1000 + b * 100 + c;
+        }
+    };
+    S.result = 0;
+
+    const f = try Fiber.create(allocator, &S.work);
+    defer f.destroy();
+
+    while (f.state != .done) f.resumeFiber();
+
+    // a=13, b=25, c=37 -> 13000 + 2500 + 37
+    try std.testing.expectEqual(@as(u64, 15537), S.result);
+}
