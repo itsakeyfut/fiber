@@ -466,3 +466,35 @@ test "independent fibers keep separate state when interleaved" {
     try std.testing.expectEqual(@as(u64, 5), S.counters[1]);
     try std.testing.expectEqual(@as(u64, 2), S.counters[2]);
 }
+
+test "create reports OutOfMemory and leaks nothing on allocation failure" {
+    const S = struct {
+        fn work(_: *Fiber) void {}
+    };
+
+    // Fail allocation index 0 (the Fiber struct): create returns the error and
+    // nothing is allocated.
+    {
+        var failing = std.testing.FailingAllocator.init(
+            std.testing.allocator,
+            .{ .fail_index = 0 },
+        );
+        try std.testing.expectError(
+            error.OutOfMemory,
+            Fiber.create(failing.allocator(), &S.work),
+        );
+    }
+
+    // Fail allocation index 1 (the stack): the Fiber struct allocation must be
+    // rolled back by errdefer. std.testing.allocator flags any leak.
+    {
+        var failing = std.testing.FailingAllocator.init(
+            std.testing.allocator,
+            .{ .fail_index = 1 },
+        );
+        try std.testing.expectError(
+            error.OutOfMemory,
+            Fiber.create(failing.allocator(), &S.work),
+        );
+    }
+}
