@@ -15,6 +15,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Expanded test coverage: cross-platform FP control-state preservation, nested
   fibers, deep-stack yields, many yields, local-variable integrity, interleaved
   independent fibers, and allocation-failure cleanup.
+- `Options` for `Fiber.create` (`stack_size`, `data`), a public `data`
+  (`?*anyopaque`) field for per-fiber payloads, and `Fiber.reset` to re-arm a
+  finished fiber for pool reuse without reallocating.
+
+### Changed
+
+- `Fiber.create` now takes an `Options` argument; pass `.{}` for the previous
+  defaults.
 
 ### Fixed
 
