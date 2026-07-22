@@ -8,8 +8,17 @@ fn fiberSwapNaked() callconv(.naked) void {
         \\  pushq %%r13
         \\  pushq %%r14
         \\  pushq %%r15
+        \\  // MXCSR (+0) and x87 control word (+8) in a 16-byte slot
+        \\  subq $16, %%rsp
+        \\  stmxcsr 0(%%rsp)
+        \\  fnstcw 8(%%rsp)
+        \\  // switch stacks
         \\  movq %%rsp, (%%rdi)
         \\  movq (%%rsi), %%rsp
+        \\  // restore MXCSR + x87 control word
+        \\  ldmxcsr 0(%%rsp)
+        \\  fldcw 8(%%rsp)
+        \\  addq $16, %%rsp
         \\  popq %%r15
         \\  popq %%r14
         \\  popq %%r13
@@ -45,6 +54,13 @@ pub fn initStack(
         sp -= @sizeOf(usize);
         @as(*usize, @ptrFromInt(sp)).* = 0;
     }
+
+    // MXCSR (+0) / x87 control word (+8) 16-byte slot with defaults, matching
+    // the Windows layout so the first swap-in loads a sane FP environment.
+    sp -= @sizeOf(usize);
+    @as(*usize, @ptrFromInt(sp)).* = 0x0000037F; // x87 control word (slot+8)
+    sp -= @sizeOf(usize);
+    @as(*usize, @ptrFromInt(sp)).* = 0x00001F80; // MXCSR (slot+0)
 
     return sp;
 }

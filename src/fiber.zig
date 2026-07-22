@@ -106,6 +106,9 @@ test "fiber runs, yields, and completes" {
 }
 
 test "xmm6 is preserved across fiber switches" {
+    // Windows-only by design: xmm6-xmm15 are callee-saved under the Win64 ABI
+    // (so the switch must preserve them), but volatile under SysV (so the
+    // switch correctly does not). This test only asserts the Win64 requirement.
     if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
@@ -143,26 +146,38 @@ test "xmm6 is preserved across fiber switches" {
     try std.testing.expect(S.ok);
 }
 
-test "mxcsr is preserved across fiber switches" {
-    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+test "FP control state is preserved across fiber switches" {
     const allocator = std.testing.allocator;
 
-    const M = struct {
-        fn get() u32 {
+    const Fp = struct {
+        fn getMxcsr() u32 {
             var v: u32 = 0;
-            // "m"/"=m" memory constraints mis-lower on this Zig 0.16 /
-            // x86_64-windows toolchain (the address gets re-spilled instead
-            // of dereferenced). Pass the address explicitly in a register
-            // and dereference it in the asm string instead.
+            // Pass the address in a register and dereference in the asm string:
+            // "m"/"=m" constraints mis-lower on the Zig 0.16 x86_64-windows path.
             asm volatile ("stmxcsr (%[o])"
                 :
                 : [o] "r" (&v),
                 : .{ .memory = true });
             return v;
         }
-        fn set(v: u32) void {
+        fn setMxcsr(v: u32) void {
             var local = v;
             asm volatile ("ldmxcsr (%[i])"
+                :
+                : [i] "r" (&local),
+                : .{ .memory = true });
+        }
+        fn getCw() u16 {
+            var v: u16 = 0;
+            asm volatile ("fnstcw (%[o])"
+                :
+                : [o] "r" (&v),
+                : .{ .memory = true });
+            return v;
+        }
+        fn setCw(v: u16) void {
+            var local = v;
+            asm volatile ("fldcw (%[i])"
                 :
                 : [i] "r" (&local),
                 : .{ .memory = true });
@@ -170,28 +185,39 @@ test "mxcsr is preserved across fiber switches" {
     };
 
     const S = struct {
-        var ok: bool = false;
-        var saved_default: u32 = 0;
+        var ok_mxcsr: bool = false;
+        var ok_cw: bool = false;
         fn work(_: *Fiber) void {
-            // Round-toward-zero = rounding-control bits (13-14) set.
-            const rc_toward_zero: u32 = (M.get() & ~@as(u32, 0x6000)) | 0x6000;
-            M.set(rc_toward_zero);
+            // MXCSR round-toward-zero: RC bits 13-14 set.
+            Fp.setMxcsr((Fp.getMxcsr() & ~@as(u32, 0x6000)) | 0x6000);
+            // x87 round-toward-zero: RC bits 10-11 set.
+            Fp.setCw(Fp.getCw() | 0x0C00);
             Fiber.yield();
-            ok = (M.get() & 0x6000) == 0x6000;
-            M.set(saved_default); // restore for the test runner
+            ok_mxcsr = (Fp.getMxcsr() & 0x6000) == 0x6000;
+            ok_cw = (Fp.getCw() & 0x0C00) == 0x0C00;
         }
     };
-    S.ok = false;
-    S.saved_default = M.get();
+    S.ok_mxcsr = false;
+    S.ok_cw = false;
+
+    const saved_mxcsr = Fp.getMxcsr();
+    const saved_cw = Fp.getCw();
 
     const f = try Fiber.create(allocator, &S.work);
     defer f.destroy();
 
     while (f.state != .done) {
-        M.set(S.saved_default & ~@as(u32, 0x6000)); // round-to-nearest in caller
+        // Caller runs in the default rounding mode between resumes, so a leaked
+        // control word from the fiber would corrupt the fiber's own check.
+        Fp.setMxcsr(saved_mxcsr & ~@as(u32, 0x6000));
+        Fp.setCw(0x037F);
         f.resumeFiber();
     }
-    M.set(S.saved_default);
 
-    try std.testing.expect(S.ok);
+    // Restore the test runner's FP environment.
+    Fp.setMxcsr(saved_mxcsr);
+    Fp.setCw(saved_cw);
+
+    try std.testing.expect(S.ok_mxcsr);
+    try std.testing.expect(S.ok_cw);
 }

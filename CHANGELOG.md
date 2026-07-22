@@ -13,6 +13,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `zig build examples`.
 - GitHub Actions CI building and testing on Linux and Windows (x86_64).
 
+### Fixed
+
+- The SysV (Linux/BSD) context switch now preserves the MXCSR control bits and
+  the x87 control word across a switch, matching the Windows path and the SysV
+  ABI. Previously a fiber that changed the rounding mode or FP exception masks
+  could leak that state into whatever ran next.
+
 ### Removed
 
 - `src/main.zig`; the demo now lives under `examples/`.
