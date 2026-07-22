@@ -12,10 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `examples/basic.zig` and `examples/scheduler.zig`, runnable via
   `zig build examples`.
 - GitHub Actions CI building and testing on Linux and Windows (x86_64).
-- Expanded test coverage: cross-platform FP control-state preservation,
-  callee-saved general-purpose registers, nested fibers, deep-stack yields,
-  many yields, local-variable integrity, interleaved independent fibers, and
-  allocation-failure cleanup.
+- Expanded test coverage: cross-platform FP control-state preservation, nested
+  fibers, deep-stack yields, many yields, local-variable integrity, interleaved
+  independent fibers, and allocation-failure cleanup.
 
 ### Fixed
 
