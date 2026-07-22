@@ -68,7 +68,7 @@ fn worker(_: *Fiber) void {
 pub fn main() !void {
     const allocator = std.heap.page_allocator;
 
-    const f = try Fiber.create(allocator, &worker);
+    const f = try Fiber.create(allocator, &worker, .{});
     defer f.destroy();
 
     std.debug.print("main: start\n", .{});
@@ -92,7 +92,10 @@ The `fiber` module exposes a single stackful fiber type.
 
 | Symbol | Signature | Description |
 | --- | --- | --- |
-| `Fiber.create` | `(allocator, entry: *const fn (*Fiber) void) !*Fiber` | Allocate a fiber and its stack, ready to run `entry`. Does not start it. |
+| `Options` | `struct { stack_size: usize = 64*1024, data: ?*anyopaque = null }` | Options for `create` — stack size and an initial `data` payload. |
+| `Fiber.create` | `(allocator, entry, options: Options) !*Fiber` | Allocate a fiber and its stack. `options` sets the stack size and initial `data`. Pass `.{}` for defaults. Does not start it. |
+| `Fiber.reset` | `(*Fiber, entry, data: ?*anyopaque) void` | Re-arm a finished (or never-started) fiber with a new entry and data, reusing its stack. The pooling primitive. |
+| `data` | `?*anyopaque` field | Per-fiber user payload; set via `Options` or directly, read in the entry via `fiber.data`. |
 | `Fiber.destroy` | `(*Fiber) void` | Free the fiber and its stack. |
 | `Fiber.resumeFiber` | `(*Fiber) void` | Switch into the fiber. Returns when the fiber yields or finishes. |
 | `Fiber.yield` | `() void` | Suspend the current fiber and switch back to its caller. Panics if called outside a fiber. |
@@ -100,7 +103,7 @@ The `fiber` module exposes a single stackful fiber type.
 
 `yield` is also re-exported at the module root as `@import("fiber").yield`.
 
-Each fiber allocates a fixed **64 KiB** stack at `create` time. `entry` receives its
+Each fiber allocates a stack — **64 KiB by default**, configurable via `Options.stack_size` — at `create` time. `entry` receives its
 own `*Fiber` so it can reach fiber-local data; returning from `entry` moves the fiber
 to `.done`, after which it must not be resumed again.
 

@@ -4,6 +4,17 @@ const Context = context.Context;
 
 pub const State = enum { ready, running, suspended, done };
 
+/// Default fiber stack size (64 KiB), used when `Options.stack_size` is unset.
+pub const default_stack_size = 64 * 1024;
+
+/// Options for `Fiber.create`.
+pub const Options = struct {
+    /// Size in bytes of the stack allocated for the fiber.
+    stack_size: usize = default_stack_size,
+    /// Arbitrary user payload stored on the fiber and readable via `fiber.data`.
+    data: ?*anyopaque = null,
+};
+
 threadlocal var current: ?*Fiber = null;
 threadlocal var root_context: Context = .{};
 
@@ -14,23 +25,40 @@ pub const Fiber = struct {
     state: State = .ready,
     caller: *Context = undefined,
     allocator: std.mem.Allocator,
+    data: ?*anyopaque = null,
 
-    const default_stack_size = 64 * 1024; // 64 KiB
-
-    pub fn create(allocator: std.mem.Allocator, entry: *const fn (*Fiber) void) !*Fiber {
+    pub fn create(
+        allocator: std.mem.Allocator,
+        entry: *const fn (*Fiber) void,
+        options: Options,
+    ) !*Fiber {
         const self = try allocator.create(Fiber);
         errdefer allocator.destroy(self);
 
-        const stack = try allocator.alloc(u8, default_stack_size);
+        const stack = try allocator.alloc(u8, options.stack_size);
         errdefer allocator.free(stack);
 
         self.* = .{
             .stack = stack,
             .entry = entry,
             .allocator = allocator,
+            .data = options.data,
         };
         self.setupStack();
         return self;
+    }
+
+    /// Re-arm a finished (or never-started) fiber with a new entry and data,
+    /// reusing the existing stack allocation. This is the pooling primitive:
+    /// create a pool of fibers once, then `reset` each between jobs instead of
+    /// reallocating a stack per job. Must not be called on a running or
+    /// suspended fiber — that would orphan its in-progress frame.
+    pub fn reset(self: *Fiber, entry: *const fn (*Fiber) void, data: ?*anyopaque) void {
+        std.debug.assert(self.state == .done or self.state == .ready);
+        self.entry = entry;
+        self.data = data;
+        self.state = .ready;
+        self.setupStack();
     }
 
     pub fn destroy(self: *Fiber) void {
@@ -92,7 +120,7 @@ test "fiber runs, yields, and completes" {
     };
     S.ticks = 0;
 
-    const f = try Fiber.create(allocator, &S.work);
+    const f = try Fiber.create(allocator, &S.work, .{});
     defer f.destroy();
 
     var resumes: usize = 0;
@@ -130,7 +158,7 @@ test "xmm6 is preserved across fiber switches" {
     };
     S.ok = false;
 
-    const f = try Fiber.create(allocator, &S.work);
+    const f = try Fiber.create(allocator, &S.work, .{});
     defer f.destroy();
 
     while (f.state != .done) {
@@ -235,7 +263,7 @@ test "FP control state is preserved across fiber switches" {
     const saved_mxcsr = Fp.getMxcsr();
     const saved_cw = Fp.getCw();
 
-    const f = try Fiber.create(allocator, &S.work);
+    const f = try Fiber.create(allocator, &S.work, .{});
     defer f.destroy();
 
     while (f.state != .done) {
@@ -281,11 +309,11 @@ test "a fiber can resume another fiber (nesting)" {
     };
     S.n = 0;
 
-    const inner = try Fiber.create(allocator, &S.inner);
+    const inner = try Fiber.create(allocator, &S.inner, .{});
     defer inner.destroy();
     S.inner_fiber = inner;
 
-    const outer = try Fiber.create(allocator, &S.outer);
+    const outer = try Fiber.create(allocator, &S.outer, .{});
     defer outer.destroy();
 
     while (outer.state != .done) outer.resumeFiber();
@@ -318,7 +346,7 @@ test "yield works from deep in the call stack" {
     S.reached = 0;
     S.resumed = 0;
 
-    const f = try Fiber.create(allocator, &S.work);
+    const f = try Fiber.create(allocator, &S.work, .{});
     defer f.destroy();
 
     f.resumeFiber(); // descends 100 frames, then yields
@@ -346,7 +374,7 @@ test "a fiber can yield many times" {
     };
     S.count = 0;
 
-    const f = try Fiber.create(allocator, &S.work);
+    const f = try Fiber.create(allocator, &S.work, .{});
     defer f.destroy();
 
     var resumes: usize = 0;
@@ -378,7 +406,7 @@ test "local variables survive across yields" {
     };
     S.result = 0;
 
-    const f = try Fiber.create(allocator, &S.work);
+    const f = try Fiber.create(allocator, &S.work, .{});
     defer f.destroy();
 
     while (f.state != .done) f.resumeFiber();
@@ -420,9 +448,9 @@ test "independent fibers keep separate state when interleaved" {
     S.counters = .{ 0, 0, 0 };
 
     const fibers = [_]*Fiber{
-        try Fiber.create(allocator, &S.w0),
-        try Fiber.create(allocator, &S.w1),
-        try Fiber.create(allocator, &S.w2),
+        try Fiber.create(allocator, &S.w0, .{}),
+        try Fiber.create(allocator, &S.w1, .{}),
+        try Fiber.create(allocator, &S.w2, .{}),
     };
     defer for (fibers) |f| f.destroy();
 
@@ -463,7 +491,7 @@ test "create reports OutOfMemory and leaks nothing on allocation failure" {
         );
         try std.testing.expectError(
             error.OutOfMemory,
-            Fiber.create(failing.allocator(), &S.work),
+            Fiber.create(failing.allocator(), &S.work, .{}),
         );
     }
 
@@ -476,7 +504,108 @@ test "create reports OutOfMemory and leaks nothing on allocation failure" {
         );
         try std.testing.expectError(
             error.OutOfMemory,
-            Fiber.create(failing.allocator(), &S.work),
+            Fiber.create(failing.allocator(), &S.work, .{}),
         );
     }
+}
+
+test "fiber data payload is passed through and readable by the entry" {
+    const allocator = std.testing.allocator;
+
+    const S = struct {
+        const Ctx = struct { value: u32 };
+        fn work(f: *Fiber) void {
+            const ctx: *Ctx = @ptrCast(@alignCast(f.data.?));
+            ctx.value += 100;
+        }
+    };
+
+    var ctx = S.Ctx{ .value = 1 };
+    const f = try Fiber.create(allocator, &S.work, .{ .data = &ctx });
+    defer f.destroy();
+
+    while (f.state != .done) f.resumeFiber();
+
+    try std.testing.expectEqual(@as(u32, 101), ctx.value);
+}
+
+test "fiber data can be set on the handle after create" {
+    const allocator = std.testing.allocator;
+
+    const S = struct {
+        const Ctx = struct { value: u32 };
+        fn work(f: *Fiber) void {
+            const ctx: *Ctx = @ptrCast(@alignCast(f.data.?));
+            ctx.value = 42;
+        }
+    };
+
+    var ctx = S.Ctx{ .value = 0 };
+    const f = try Fiber.create(allocator, &S.work, .{});
+    defer f.destroy();
+    f.data = &ctx; // set after create, before first resume
+
+    while (f.state != .done) f.resumeFiber();
+
+    try std.testing.expectEqual(@as(u32, 42), ctx.value);
+}
+
+test "custom stack size is honored" {
+    const allocator = std.testing.allocator;
+
+    const S = struct {
+        var ran: bool = false;
+        fn work(_: *Fiber) void {
+            Fiber.yield();
+            ran = true;
+        }
+    };
+    S.ran = false;
+
+    const custom = 128 * 1024; // differs from the 64 KiB default
+    const f = try Fiber.create(allocator, &S.work, .{ .stack_size = custom });
+    defer f.destroy();
+
+    try std.testing.expectEqual(@as(usize, custom), f.stack.len);
+
+    while (f.state != .done) f.resumeFiber();
+    try std.testing.expect(S.ran);
+}
+
+test "reset re-arms a finished fiber for reuse without reallocating" {
+    const allocator = std.testing.allocator;
+
+    const S = struct {
+        var first_ran: u32 = 0;
+        fn first(_: *Fiber) void {
+            first_ran += 1;
+        }
+        fn second(f: *Fiber) void {
+            const n: *u32 = @ptrCast(@alignCast(f.data.?));
+            n.* += 10;
+            Fiber.yield(); // suspend/resume on the re-armed (reused) stack
+            n.* += 100;
+        }
+    };
+    S.first_ran = 0;
+
+    const f = try Fiber.create(allocator, &S.first, .{});
+    defer f.destroy();
+
+    const stack_ptr = f.stack.ptr;
+    const stack_len = f.stack.len;
+
+    while (f.state != .done) f.resumeFiber();
+    try std.testing.expectEqual(@as(u32, 1), S.first_ran);
+    try std.testing.expectEqual(State.done, f.state);
+
+    // Re-arm the same fiber with a new entry + data; same stack buffer.
+    var counter: u32 = 5;
+    f.reset(&S.second, &counter);
+    try std.testing.expectEqual(State.ready, f.state);
+    try std.testing.expectEqual(stack_ptr, f.stack.ptr); // no realloc
+    try std.testing.expectEqual(stack_len, f.stack.len);
+
+    while (f.state != .done) f.resumeFiber();
+    try std.testing.expectEqual(@as(u32, 115), counter);
 }

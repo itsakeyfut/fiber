@@ -39,7 +39,7 @@ pub fn main(init: std.process.Init) !void {
     var created: usize = 0;
     errdefer for (fibers[0..created]) |f| f.destroy();
     for (&fibers, entries) |*slot, entry| {
-        slot.* = try Fiber.create(gpa, entry);
+        slot.* = try Fiber.create(gpa, entry, .{});
         created += 1;
     }
     defer for (fibers) |f| f.destroy();
