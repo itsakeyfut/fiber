@@ -51,7 +51,8 @@ pub const Fiber = struct {
     /// Re-arm a finished (or never-started) fiber with a new entry and data,
     /// reusing the existing stack allocation. This is the pooling primitive:
     /// create a pool of fibers once, then `reset` each between jobs instead of
-    /// reallocating a stack per job.
+    /// reallocating a stack per job. Must not be called on a running or
+    /// suspended fiber — that would orphan its in-progress frame.
     pub fn reset(self: *Fiber, entry: *const fn (*Fiber) void, data: ?*anyopaque) void {
         std.debug.assert(self.state == .done or self.state == .ready);
         self.entry = entry;
@@ -555,7 +556,6 @@ test "custom stack size is honored" {
     const S = struct {
         var ran: bool = false;
         fn work(_: *Fiber) void {
-            ran = true;
             Fiber.yield();
             ran = true;
         }
@@ -583,6 +583,8 @@ test "reset re-arms a finished fiber for reuse without reallocating" {
         fn second(f: *Fiber) void {
             const n: *u32 = @ptrCast(@alignCast(f.data.?));
             n.* += 10;
+            Fiber.yield(); // suspend/resume on the re-armed (reused) stack
+            n.* += 100;
         }
     };
     S.first_ran = 0;
@@ -605,5 +607,5 @@ test "reset re-arms a finished fiber for reuse without reallocating" {
     try std.testing.expectEqual(stack_len, f.stack.len);
 
     while (f.state != .done) f.resumeFiber();
-    try std.testing.expectEqual(@as(u32, 15), counter);
+    try std.testing.expectEqual(@as(u32, 115), counter);
 }
