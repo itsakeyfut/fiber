@@ -20,7 +20,7 @@ fn counter(_: *Fiber) void {
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
 
-    const f = try Fiber.create(gpa, &counter);
+    const f = try Fiber.create(gpa, &counter, .{});
     defer f.destroy();
 
     std.debug.print("main: created fiber (state={s})\n", .{@tagName(f.state)});
