@@ -221,3 +221,61 @@ test "FP control state is preserved across fiber switches" {
     try std.testing.expect(S.ok_mxcsr);
     try std.testing.expect(S.ok_cw);
 }
+
+test "callee-saved general-purpose registers survive fiber switches" {
+    const allocator = std.testing.allocator;
+
+    const S = struct {
+        var ok: bool = false;
+        fn work(_: *Fiber) void {
+            asm volatile (
+                \\ movabsq $0x1111111111111111, %%rbx
+                \\ movabsq $0x2222222222222222, %%r12
+                \\ movabsq $0x3333333333333333, %%r13
+                \\ movabsq $0x4444444444444444, %%r14
+                \\ movabsq $0x5555555555555555, %%r15
+                ::: .{ .rbx = true, .r12 = true, .r13 = true, .r14 = true, .r15 = true });
+            Fiber.yield();
+            var b: u64 = 0;
+            var c12: u64 = 0;
+            var c13: u64 = 0;
+            var c14: u64 = 0;
+            var c15: u64 = 0;
+            asm volatile (
+                \\ movq %%rbx, %[b]
+                \\ movq %%r12, %[c12]
+                \\ movq %%r13, %[c13]
+                \\ movq %%r14, %[c14]
+                \\ movq %%r15, %[c15]
+                : [b] "=r" (b),
+                  [c12] "=r" (c12),
+                  [c13] "=r" (c13),
+                  [c14] "=r" (c14),
+                  [c15] "=r" (c15),
+                :
+                : .{ .rbx = true, .r12 = true, .r13 = true, .r14 = true, .r15 = true });
+            ok = b == 0x1111111111111111 and c12 == 0x2222222222222222 and
+                c13 == 0x3333333333333333 and c14 == 0x4444444444444444 and
+                c15 == 0x5555555555555555;
+        }
+    };
+    S.ok = false;
+
+    const f = try Fiber.create(allocator, &S.work);
+    defer f.destroy();
+
+    while (f.state != .done) {
+        // Clobber every callee-saved GP register in the caller between resumes,
+        // so a switch that failed to preserve them would be caught.
+        asm volatile (
+            \\ movabsq $0xdeadbeefdeadbeef, %%rbx
+            \\ movabsq $0xdeadbeefdeadbeef, %%r12
+            \\ movabsq $0xdeadbeefdeadbeef, %%r13
+            \\ movabsq $0xdeadbeefdeadbeef, %%r14
+            \\ movabsq $0xdeadbeefdeadbeef, %%r15
+            ::: .{ .rbx = true, .r12 = true, .r13 = true, .r14 = true, .r15 = true });
+        f.resumeFiber();
+    }
+
+    try std.testing.expect(S.ok);
+}
