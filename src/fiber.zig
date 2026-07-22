@@ -106,6 +106,9 @@ test "fiber runs, yields, and completes" {
 }
 
 test "xmm6 is preserved across fiber switches" {
+    // Windows-only by design: xmm6-xmm15 are callee-saved under the Win64 ABI
+    // (so the switch must preserve them), but volatile under SysV (so the
+    // switch correctly does not). This test only asserts the Win64 requirement.
     if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
@@ -143,55 +146,337 @@ test "xmm6 is preserved across fiber switches" {
     try std.testing.expect(S.ok);
 }
 
-test "mxcsr is preserved across fiber switches" {
-    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+test "FP control state is preserved across fiber switches" {
     const allocator = std.testing.allocator;
 
-    const M = struct {
-        fn get() u32 {
+    const Fp = struct {
+        // MXCSR / x87 control-word access differs by target: the "m"/"=m"
+        // constraint mis-lowers on the Zig 0.16 x86_64-windows path (the address
+        // is re-spilled instead of dereferenced), so Windows passes the address
+        // in a register and dereferences it in the asm string; other targets use
+        // the standard memory constraint, which the Windows path rejects.
+        const is_windows = @import("builtin").os.tag == .windows;
+        fn getMxcsr() u32 {
             var v: u32 = 0;
-            // "m"/"=m" memory constraints mis-lower on this Zig 0.16 /
-            // x86_64-windows toolchain (the address gets re-spilled instead
-            // of dereferenced). Pass the address explicitly in a register
-            // and dereference it in the asm string instead.
-            asm volatile ("stmxcsr (%[o])"
-                :
-                : [o] "r" (&v),
-                : .{ .memory = true });
+            if (is_windows) {
+                asm volatile ("stmxcsr (%[o])"
+                    :
+                    : [o] "r" (&v),
+                    : .{ .memory = true });
+            } else {
+                asm volatile ("stmxcsr %[o]"
+                    : [o] "=m" (v),
+                );
+            }
             return v;
         }
-        fn set(v: u32) void {
-            var local = v;
-            asm volatile ("ldmxcsr (%[i])"
-                :
-                : [i] "r" (&local),
-                : .{ .memory = true });
+        fn setMxcsr(v: u32) void {
+            if (is_windows) {
+                var local = v;
+                asm volatile ("ldmxcsr (%[i])"
+                    :
+                    : [i] "r" (&local),
+                    : .{ .memory = true });
+            } else {
+                const local = v;
+                asm volatile ("ldmxcsr %[i]"
+                    :
+                    : [i] "m" (local),
+                );
+            }
+        }
+        fn getCw() u16 {
+            var v: u16 = 0;
+            if (is_windows) {
+                asm volatile ("fnstcw (%[o])"
+                    :
+                    : [o] "r" (&v),
+                    : .{ .memory = true });
+            } else {
+                asm volatile ("fnstcw %[o]"
+                    : [o] "=m" (v),
+                );
+            }
+            return v;
+        }
+        fn setCw(v: u16) void {
+            if (is_windows) {
+                var local = v;
+                asm volatile ("fldcw (%[i])"
+                    :
+                    : [i] "r" (&local),
+                    : .{ .memory = true });
+            } else {
+                const local = v;
+                asm volatile ("fldcw %[i]"
+                    :
+                    : [i] "m" (local),
+                );
+            }
         }
     };
 
     const S = struct {
-        var ok: bool = false;
-        var saved_default: u32 = 0;
+        var ok_mxcsr: bool = false;
+        var ok_cw: bool = false;
         fn work(_: *Fiber) void {
-            // Round-toward-zero = rounding-control bits (13-14) set.
-            const rc_toward_zero: u32 = (M.get() & ~@as(u32, 0x6000)) | 0x6000;
-            M.set(rc_toward_zero);
+            // MXCSR round-toward-zero: RC bits 13-14 set.
+            Fp.setMxcsr((Fp.getMxcsr() & ~@as(u32, 0x6000)) | 0x6000);
+            // x87 round-toward-zero: RC bits 10-11 set.
+            Fp.setCw(Fp.getCw() | 0x0C00);
             Fiber.yield();
-            ok = (M.get() & 0x6000) == 0x6000;
-            M.set(saved_default); // restore for the test runner
+            ok_mxcsr = (Fp.getMxcsr() & 0x6000) == 0x6000;
+            ok_cw = (Fp.getCw() & 0x0C00) == 0x0C00;
         }
     };
-    S.ok = false;
-    S.saved_default = M.get();
+    S.ok_mxcsr = false;
+    S.ok_cw = false;
+
+    const saved_mxcsr = Fp.getMxcsr();
+    const saved_cw = Fp.getCw();
 
     const f = try Fiber.create(allocator, &S.work);
     defer f.destroy();
 
     while (f.state != .done) {
-        M.set(S.saved_default & ~@as(u32, 0x6000)); // round-to-nearest in caller
+        // Caller runs in the default rounding mode between resumes, so a leaked
+        // control word from the fiber would corrupt the fiber's own check.
+        Fp.setMxcsr(saved_mxcsr & ~@as(u32, 0x6000));
+        Fp.setCw(0x037F);
         f.resumeFiber();
     }
-    M.set(S.saved_default);
 
-    try std.testing.expect(S.ok);
+    // Restore the test runner's FP environment.
+    Fp.setMxcsr(saved_mxcsr);
+    Fp.setCw(saved_cw);
+
+    try std.testing.expect(S.ok_mxcsr);
+    try std.testing.expect(S.ok_cw);
+}
+
+test "a fiber can resume another fiber (nesting)" {
+    const allocator = std.testing.allocator;
+
+    const S = struct {
+        var log: [8]u8 = undefined;
+        var n: usize = 0;
+        var inner_fiber: *Fiber = undefined;
+
+        fn record(c: u8) void {
+            log[n] = c;
+            n += 1;
+        }
+        fn inner(_: *Fiber) void {
+            record('b');
+            Fiber.yield();
+            record('d');
+        }
+        fn outer(_: *Fiber) void {
+            record('a');
+            inner_fiber.resumeFiber(); // nested resume
+            record('c');
+            inner_fiber.resumeFiber(); // resume inner to completion
+            record('e');
+        }
+    };
+    S.n = 0;
+
+    const inner = try Fiber.create(allocator, &S.inner);
+    defer inner.destroy();
+    S.inner_fiber = inner;
+
+    const outer = try Fiber.create(allocator, &S.outer);
+    defer outer.destroy();
+
+    while (outer.state != .done) outer.resumeFiber();
+
+    try std.testing.expectEqual(@as(usize, 5), S.n);
+    try std.testing.expectEqualSlices(u8, "abcde", S.log[0..5]);
+    try std.testing.expectEqual(State.done, inner.state);
+    try std.testing.expectEqual(State.done, outer.state);
+}
+
+test "yield works from deep in the call stack" {
+    const allocator = std.testing.allocator;
+
+    const S = struct {
+        var reached: usize = 0;
+        var resumed: usize = 0;
+        fn recurse(depth: usize) void {
+            if (depth == 0) {
+                reached = 100;
+                Fiber.yield();
+                resumed = 200;
+                return;
+            }
+            recurse(depth - 1);
+        }
+        fn work(_: *Fiber) void {
+            recurse(100);
+        }
+    };
+    S.reached = 0;
+    S.resumed = 0;
+
+    const f = try Fiber.create(allocator, &S.work);
+    defer f.destroy();
+
+    f.resumeFiber(); // descends 100 frames, then yields
+    try std.testing.expectEqual(@as(usize, 100), S.reached);
+    try std.testing.expectEqual(@as(usize, 0), S.resumed);
+    try std.testing.expectEqual(State.suspended, f.state);
+
+    f.resumeFiber(); // continues from deep in the stack to completion
+    try std.testing.expectEqual(@as(usize, 200), S.resumed);
+    try std.testing.expectEqual(State.done, f.state);
+}
+
+test "a fiber can yield many times" {
+    const allocator = std.testing.allocator;
+
+    const S = struct {
+        var count: usize = 0;
+        fn work(_: *Fiber) void {
+            var i: usize = 0;
+            while (i < 10_000) : (i += 1) {
+                count += 1;
+                Fiber.yield();
+            }
+        }
+    };
+    S.count = 0;
+
+    const f = try Fiber.create(allocator, &S.work);
+    defer f.destroy();
+
+    var resumes: usize = 0;
+    while (f.state != .done) {
+        f.resumeFiber();
+        resumes += 1;
+    }
+
+    try std.testing.expectEqual(@as(usize, 10_000), S.count);
+    try std.testing.expectEqual(@as(usize, 10_001), resumes);
+}
+
+test "local variables survive across yields" {
+    const allocator = std.testing.allocator;
+
+    const S = struct {
+        var result: u64 = 0;
+        fn work(_: *Fiber) void {
+            var a: u64 = 3;
+            var b: u64 = 5;
+            var c: u64 = 7;
+            Fiber.yield();
+            a += 10;
+            b += 20;
+            Fiber.yield();
+            c += 30;
+            result = a * 1000 + b * 100 + c;
+        }
+    };
+    S.result = 0;
+
+    const f = try Fiber.create(allocator, &S.work);
+    defer f.destroy();
+
+    while (f.state != .done) f.resumeFiber();
+
+    // a=13, b=25, c=37 -> 13000 + 2500 + 37
+    try std.testing.expectEqual(@as(u64, 15537), S.result);
+}
+
+test "independent fibers keep separate state when interleaved" {
+    const allocator = std.testing.allocator;
+
+    const S = struct {
+        var counters = [_]u64{ 0, 0, 0 };
+        // Three sibling entries, one per fiber. Each references `counters`
+        // unqualified (a sibling container var), avoiding a self-reference to
+        // the local `S` from a nested struct, which does not compile.
+        fn w0(_: *Fiber) void {
+            var i: usize = 0;
+            while (i < 3) : (i += 1) {
+                counters[0] += 1;
+                Fiber.yield();
+            }
+        }
+        fn w1(_: *Fiber) void {
+            var i: usize = 0;
+            while (i < 5) : (i += 1) {
+                counters[1] += 1;
+                Fiber.yield();
+            }
+        }
+        fn w2(_: *Fiber) void {
+            var i: usize = 0;
+            while (i < 2) : (i += 1) {
+                counters[2] += 1;
+                Fiber.yield();
+            }
+        }
+    };
+    S.counters = .{ 0, 0, 0 };
+
+    const fibers = [_]*Fiber{
+        try Fiber.create(allocator, &S.w0),
+        try Fiber.create(allocator, &S.w1),
+        try Fiber.create(allocator, &S.w2),
+    };
+    defer for (fibers) |f| f.destroy();
+
+    // One resume each: under true interleaving every fiber advances exactly
+    // once. Serial run-to-completion would instead drive the first fiber to 3
+    // before the second ever started, so this positively confirms interleaving.
+    for (fibers) |f| f.resumeFiber();
+    try std.testing.expectEqual(@as(u64, 1), S.counters[0]);
+    try std.testing.expectEqual(@as(u64, 1), S.counters[1]);
+    try std.testing.expectEqual(@as(u64, 1), S.counters[2]);
+
+    var remaining: usize = fibers.len;
+    while (remaining > 0) {
+        remaining = 0;
+        for (fibers) |f| {
+            if (f.state == .done) continue;
+            f.resumeFiber();
+            if (f.state != .done) remaining += 1;
+        }
+    }
+
+    try std.testing.expectEqual(@as(u64, 3), S.counters[0]);
+    try std.testing.expectEqual(@as(u64, 5), S.counters[1]);
+    try std.testing.expectEqual(@as(u64, 2), S.counters[2]);
+}
+
+test "create reports OutOfMemory and leaks nothing on allocation failure" {
+    const S = struct {
+        fn work(_: *Fiber) void {}
+    };
+
+    // Fail allocation index 0 (the Fiber struct): create returns the error and
+    // nothing is allocated.
+    {
+        var failing = std.testing.FailingAllocator.init(
+            std.testing.allocator,
+            .{ .fail_index = 0 },
+        );
+        try std.testing.expectError(
+            error.OutOfMemory,
+            Fiber.create(failing.allocator(), &S.work),
+        );
+    }
+
+    // Fail allocation index 1 (the stack): the Fiber struct allocation must be
+    // rolled back by errdefer. std.testing.allocator flags any leak.
+    {
+        var failing = std.testing.FailingAllocator.init(
+            std.testing.allocator,
+            .{ .fail_index = 1 },
+        );
+        try std.testing.expectError(
+            error.OutOfMemory,
+            Fiber.create(failing.allocator(), &S.work),
+        );
+    }
 }
