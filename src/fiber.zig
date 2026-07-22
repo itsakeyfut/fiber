@@ -279,3 +279,45 @@ test "callee-saved general-purpose registers survive fiber switches" {
 
     try std.testing.expect(S.ok);
 }
+
+test "a fiber can resume another fiber (nesting)" {
+    const allocator = std.testing.allocator;
+
+    const S = struct {
+        var log: [8]u8 = undefined;
+        var n: usize = 0;
+        var inner_fiber: *Fiber = undefined;
+
+        fn record(c: u8) void {
+            log[n] = c;
+            n += 1;
+        }
+        fn inner(_: *Fiber) void {
+            record('b');
+            Fiber.yield();
+            record('d');
+        }
+        fn outer(_: *Fiber) void {
+            record('a');
+            inner_fiber.resumeFiber(); // nested resume
+            record('c');
+            inner_fiber.resumeFiber(); // resume inner to completion
+            record('e');
+        }
+    };
+    S.n = 0;
+
+    const inner = try Fiber.create(allocator, &S.inner);
+    defer inner.destroy();
+    S.inner_fiber = inner;
+
+    const outer = try Fiber.create(allocator, &S.outer);
+    defer outer.destroy();
+
+    while (outer.state != .done) outer.resumeFiber();
+
+    try std.testing.expectEqual(@as(usize, 5), S.n);
+    try std.testing.expectEqualSlices(u8, "abcde", S.log[0..5]);
+    try std.testing.expectEqual(State.done, inner.state);
+    try std.testing.expectEqual(State.done, outer.state);
+}
