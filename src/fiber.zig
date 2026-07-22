@@ -452,6 +452,14 @@ test "independent fibers keep separate state when interleaved" {
     };
     defer for (fibers) |f| f.destroy();
 
+    // One resume each: under true interleaving every fiber advances exactly
+    // once. Serial run-to-completion would instead drive the first fiber to 3
+    // before the second ever started, so this positively confirms interleaving.
+    for (fibers) |f| f.resumeFiber();
+    try std.testing.expectEqual(@as(u64, 1), S.counters[0]);
+    try std.testing.expectEqual(@as(u64, 1), S.counters[1]);
+    try std.testing.expectEqual(@as(u64, 1), S.counters[2]);
+
     var remaining: usize = fibers.len;
     while (remaining > 0) {
         remaining = 0;
