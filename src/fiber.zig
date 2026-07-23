@@ -178,69 +178,63 @@ test "FP control state is preserved across fiber switches" {
     const allocator = std.testing.allocator;
 
     const Fp = struct {
-        // MXCSR / x87 control-word access differs by target: the "m"/"=m"
-        // constraint mis-lowers on the Zig 0.16 x86_64-windows path (the address
-        // is re-spilled instead of dereferenced), so Windows passes the address
-        // in a register and dereferences it in the asm string; other targets use
-        // the standard memory constraint, which the Windows path rejects.
-        const is_windows = @import("builtin").os.tag == .windows;
+        // Read/write MXCSR and the x87 control word through a self-managed stack
+        // scratch. Zig 0.16 lowers the obvious operand forms inconsistently on
+        // x86_64-linux: the "m"/"=m" memory constraint produces a wrong operand
+        // address under optimized codegen (faulting `ldmxcsr` with a #GP), while
+        // the `(%reg)` register-dereference form fails to assemble in Debug
+        // ("invalid memory operand"). To dodge operand lowering entirely, move rsp
+        // below the 128-byte red zone with `lea` (which leaves the flags alone),
+        // address the scratch as `(%rsp)`, then restore rsp. Values move through
+        // plain register operands.
         fn getMxcsr() u32 {
-            var v: u32 = 0;
-            if (is_windows) {
-                asm volatile ("stmxcsr (%[o])"
-                    :
-                    : [o] "r" (&v),
-                    : .{ .memory = true });
-            } else {
-                asm volatile ("stmxcsr %[o]"
-                    : [o] "=m" (v),
-                );
-            }
-            return v;
+            var v: u32 = undefined;
+            asm volatile (
+                \\ leaq -144(%%rsp), %%rsp
+                \\ stmxcsr (%%rsp)
+                \\ movl (%%rsp), %[out]
+                \\ leaq 144(%%rsp), %%rsp
+                : [out] "=r" (v),
+                :
+                : .{ .memory = true });
+            // MXCSR only defines bits 0-15; keep the result clean.
+            return v & 0xffff;
         }
         fn setMxcsr(v: u32) void {
-            if (is_windows) {
-                var local = v;
-                asm volatile ("ldmxcsr (%[i])"
-                    :
-                    : [i] "r" (&local),
-                    : .{ .memory = true });
-            } else {
-                const local = v;
-                asm volatile ("ldmxcsr %[i]"
-                    :
-                    : [i] "m" (local),
-                );
-            }
+            const clean = v & 0xffff; // ldmxcsr #GPs on reserved bits
+            asm volatile (
+                \\ leaq -144(%%rsp), %%rsp
+                \\ movl %[val], (%%rsp)
+                \\ ldmxcsr (%%rsp)
+                \\ leaq 144(%%rsp), %%rsp
+                :
+                : [val] "r" (clean),
+                : .{ .memory = true });
         }
         fn getCw() u16 {
-            var v: u16 = 0;
-            if (is_windows) {
-                asm volatile ("fnstcw (%[o])"
-                    :
-                    : [o] "r" (&v),
-                    : .{ .memory = true });
-            } else {
-                asm volatile ("fnstcw %[o]"
-                    : [o] "=m" (v),
-                );
-            }
-            return v;
+            var v: u32 = undefined;
+            asm volatile (
+                \\ leaq -144(%%rsp), %%rsp
+                \\ fnstcw (%%rsp)
+                \\ movl (%%rsp), %[out]
+                \\ leaq 144(%%rsp), %%rsp
+                : [out] "=r" (v),
+                :
+                : .{ .memory = true });
+            // fnstcw writes 2 bytes; the scratch's upper half is uninitialized, so
+            // keep only the control-word bits.
+            return @truncate(v & 0xffff);
         }
         fn setCw(v: u16) void {
-            if (is_windows) {
-                var local = v;
-                asm volatile ("fldcw (%[i])"
-                    :
-                    : [i] "r" (&local),
-                    : .{ .memory = true });
-            } else {
-                const local = v;
-                asm volatile ("fldcw %[i]"
-                    :
-                    : [i] "m" (local),
-                );
-            }
+            const wide: u32 = v;
+            asm volatile (
+                \\ leaq -144(%%rsp), %%rsp
+                \\ movl %[val], (%%rsp)
+                \\ fldcw (%%rsp)
+                \\ leaq 144(%%rsp), %%rsp
+                :
+                : [val] "r" (wide),
+                : .{ .memory = true });
         }
     };
 
