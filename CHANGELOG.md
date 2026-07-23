@@ -21,11 +21,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `min_stack_size` and a `create` check returning `error.StackTooSmall` for a
   stack smaller than one page (a too-small stack previously corrupted the heap
   during setup), plus a `destroy` precondition that the fiber must not be running.
+- A no-access guard page below every fiber stack: a stack overflow now faults
+  cleanly (SIGSEGV / access violation) instead of silently corrupting memory
+  (x86_64 Linux and Windows).
 
 ### Changed
 
 - `Fiber.create` now takes an `Options` argument; pass `.{}` for the previous
   defaults.
+- `create` now allocates the stack from the OS (a guarded mapping), not the
+  passed allocator; the allocator backs only the `Fiber` struct.
 
 ### Fixed
 

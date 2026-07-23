@@ -1,6 +1,7 @@
 const std = @import("std");
 const context = @import("arch/context.zig");
 const Context = context.Context;
+const stack_mod = @import("stack.zig");
 
 pub const State = enum { ready, running, suspended, done };
 
@@ -37,6 +38,8 @@ pub const Fiber = struct {
     /// Allocate a fiber and its stack, ready to run `entry`; does not start it.
     /// Returns `error.StackTooSmall` (before allocating) if
     /// `options.stack_size < min_stack_size`.
+    /// The stack is an OS mapping with a no-access guard page below it; the
+    /// passed allocator backs only the Fiber struct.
     pub fn create(
         allocator: std.mem.Allocator,
         entry: *const fn (*Fiber) void,
@@ -47,8 +50,8 @@ pub const Fiber = struct {
         const self = try allocator.create(Fiber);
         errdefer allocator.destroy(self);
 
-        const stack = try allocator.alloc(u8, options.stack_size);
-        errdefer allocator.free(stack);
+        const stack = try stack_mod.alloc(options.stack_size); // guard-paged; not from `allocator`
+        errdefer stack_mod.free(stack);
 
         self.* = .{
             .stack = stack,
@@ -78,7 +81,7 @@ pub const Fiber = struct {
     pub fn destroy(self: *Fiber) void {
         std.debug.assert(self.state != .running); // freeing a running stack is UB
         const allocator = self.allocator;
-        allocator.free(self.stack);
+        stack_mod.free(self.stack);
         allocator.destroy(self);
     }
 
@@ -495,31 +498,17 @@ test "create reports OutOfMemory and leaks nothing on allocation failure" {
         fn work(_: *Fiber) void {}
     };
 
-    // Fail allocation index 0 (the Fiber struct): create returns the error and
-    // nothing is allocated.
-    {
-        var failing = std.testing.FailingAllocator.init(
-            std.testing.allocator,
-            .{ .fail_index = 0 },
-        );
-        try std.testing.expectError(
-            error.OutOfMemory,
-            Fiber.create(failing.allocator(), &S.work, .{}),
-        );
-    }
-
-    // Fail allocation index 1 (the stack): the Fiber struct allocation must be
-    // rolled back by errdefer. std.testing.allocator flags any leak.
-    {
-        var failing = std.testing.FailingAllocator.init(
-            std.testing.allocator,
-            .{ .fail_index = 1 },
-        );
-        try std.testing.expectError(
-            error.OutOfMemory,
-            Fiber.create(failing.allocator(), &S.work, .{}),
-        );
-    }
+    // The passed allocator now backs only the Fiber struct (the stack is an OS
+    // mapping). Failing that single allocation must surface OutOfMemory with no
+    // leak. (An mmap/NtAllocate failure is impractical to inject and is not tested.)
+    var failing = std.testing.FailingAllocator.init(
+        std.testing.allocator,
+        .{ .fail_index = 0 },
+    );
+    try std.testing.expectError(
+        error.OutOfMemory,
+        Fiber.create(failing.allocator(), &S.work, .{}),
+    );
 }
 
 test "fiber data payload is passed through and readable by the entry" {
@@ -657,7 +646,8 @@ test "create accepts the minimum stack size" {
     const S = struct {
         var ticks: u32 = 0;
         // Minimal body by design: at the 4096 floor only ~3.8 KiB remains after
-        // the setup frame, and there is no guard page yet (C3).
+        // the setup frame, and a 4096-byte stack overflowing its usable region
+        // now faults on the guard page (C3).
         fn work(_: *Fiber) void {
             ticks += 1;
             Fiber.yield();
@@ -671,4 +661,40 @@ test "create accepts the minimum stack size" {
 
     while (f.state != .done) f.resumeFiber();
     try std.testing.expectEqual(@as(u32, 2), S.ticks);
+}
+
+test "a created fiber's stack is page-aligned and page-rounded" {
+    const ps = std.heap.pageSize();
+    const S = struct {
+        fn work(_: *Fiber) void {}
+    };
+    const f = try Fiber.create(std.testing.allocator, &S.work, .{ .stack_size = min_stack_size });
+    defer f.destroy();
+    try std.testing.expect(@intFromPtr(f.stack.ptr) % ps == 0);
+    try std.testing.expect(f.stack.len % ps == 0);
+    try std.testing.expect(f.stack.len >= min_stack_size);
+}
+
+test "a stack overflow faults on the guard page" {
+    const allocator = std.testing.allocator;
+
+    // The probe path is provided by build.zig when run via `zig build test`.
+    // This Zig's std.process has no getEnvVarOwned; std.testing.environ (set
+    // by the test runner from the process's real environment) is the current
+    // equivalent.
+    const probe = std.testing.environ.getAlloc(allocator, "FIBER_OVERFLOW_PROBE") catch return error.SkipZigTest;
+    defer allocator.free(probe);
+
+    var child = try std.process.spawn(std.testing.io, .{ .argv = &.{probe} });
+    const term = try child.wait(std.testing.io);
+
+    switch (term) {
+        // POSIX: the guard fault kills the process with a signal (SIGSEGV
+        // expected). The probe is fail-closed, so a signal can only be the guard.
+        .signal => {},
+        // Windows: an access violation terminates with a non-zero code. exit 0
+        // means the probe survived (or hit a setup error) → the guard did not fire.
+        .exited => |code| try std.testing.expect(code != 0),
+        else => return error.TestUnexpectedResult,
+    }
 }

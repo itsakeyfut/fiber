@@ -33,9 +33,26 @@ pub fn build(b: *std.Build) void {
         example_step.dependOn(&run_example.step);
     }
 
+    // Overflow probe: a standalone exe the guard-fault test spawns.
+    const probe = b.addExecutable(.{
+        .name = "overflow-probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/overflow_probe.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "fiber", .module = fiber_mod }},
+        }),
+    });
+    const probe_install = b.addInstallArtifact(probe, .{});
+
     // Tests: `zig build test`.
     const tests = b.addTest(.{ .root_module = fiber_mod });
     const run_tests = b.addRunArtifact(tests);
+    run_tests.step.dependOn(&probe_install.step);
+    run_tests.setEnvironmentVariable(
+        "FIBER_OVERFLOW_PROBE",
+        b.getInstallPath(.bin, b.fmt("overflow-probe{s}", .{target.result.exeFileExt()})),
+    );
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
 }
