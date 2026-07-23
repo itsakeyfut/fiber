@@ -7,6 +7,13 @@ pub const State = enum { ready, running, suspended, done };
 /// Default fiber stack size (64 KiB), used when `Options.stack_size` is unset.
 pub const default_stack_size = 64 * 1024;
 
+/// Smallest stack `create` accepts (one page). Comfortably above the initial
+/// frame `initStack` writes (~280 bytes on Windows), it prevents a too-small
+/// stack from corrupting the heap during setup, and catches unit-confusion
+/// mistakes (bytes vs. KiB). It is a floor, not a recommendation: a stack this
+/// small holds the setup frame and ~3.8 KiB of working space, little more.
+pub const min_stack_size = 4096;
+
 /// Options for `Fiber.create`.
 pub const Options = struct {
     /// Size in bytes of the stack allocated for the fiber.
@@ -27,11 +34,16 @@ pub const Fiber = struct {
     allocator: std.mem.Allocator,
     data: ?*anyopaque = null,
 
+    /// Allocate a fiber and its stack, ready to run `entry`; does not start it.
+    /// Returns `error.StackTooSmall` (before allocating) if
+    /// `options.stack_size < min_stack_size`.
     pub fn create(
         allocator: std.mem.Allocator,
         entry: *const fn (*Fiber) void,
         options: Options,
     ) !*Fiber {
+        if (options.stack_size < min_stack_size) return error.StackTooSmall;
+
         const self = try allocator.create(Fiber);
         errdefer allocator.destroy(self);
 
@@ -61,7 +73,10 @@ pub const Fiber = struct {
         self.setupStack();
     }
 
+    /// Free the fiber and its stack. Must not be called on a `.running` fiber —
+    /// that frees the stack in use. `.ready`, `.suspended`, and `.done` are fine.
     pub fn destroy(self: *Fiber) void {
+        std.debug.assert(self.state != .running); // freeing a running stack is UB
         const allocator = self.allocator;
         allocator.free(self.stack);
         allocator.destroy(self);
@@ -71,6 +86,8 @@ pub const Fiber = struct {
         self.context.rsp = context.initStack(self.stack, &trampoline, &trampolineTrap);
     }
 
+    /// Switch into the fiber and run until it yields or finishes. The fiber must
+    /// be `.ready` or `.suspended` (never `.running` or `.done`).
     pub fn resumeFiber(self: *Fiber) void {
         std.debug.assert(self.state == .ready or self.state == .suspended);
 
@@ -86,6 +103,8 @@ pub const Fiber = struct {
         current = prev;
     }
 
+    /// Suspend the running fiber and switch back to its caller. Must be called
+    /// from within a running fiber; panics otherwise.
     pub fn yield() void {
         const self = current orelse @panic("yield() called outside of a fiber");
         self.state = .suspended;
@@ -602,4 +621,54 @@ test "reset re-arms a finished fiber for reuse without reallocating" {
 
     while (f.state != .done) f.resumeFiber();
     try std.testing.expectEqual(@as(u32, 115), counter);
+}
+
+test "create rejects a stack size below the minimum before allocating" {
+    const S = struct {
+        fn work(_: *Fiber) void {}
+    };
+
+    // Below the floor -> error.
+    try std.testing.expectError(
+        error.StackTooSmall,
+        Fiber.create(std.testing.allocator, &S.work, .{ .stack_size = 0 }),
+    );
+    try std.testing.expectError(
+        error.StackTooSmall,
+        Fiber.create(std.testing.allocator, &S.work, .{ .stack_size = min_stack_size - 1 }),
+    );
+
+    // Prove the check precedes any allocation: with a FailingAllocator whose
+    // first allocation fails, a too-small size must still yield StackTooSmall
+    // (the allocator is never reached) rather than OutOfMemory.
+    var failing = std.testing.FailingAllocator.init(
+        std.testing.allocator,
+        .{ .fail_index = 0 },
+    );
+    try std.testing.expectError(
+        error.StackTooSmall,
+        Fiber.create(failing.allocator(), &S.work, .{ .stack_size = 0 }),
+    );
+}
+
+test "create accepts the minimum stack size" {
+    const allocator = std.testing.allocator;
+
+    const S = struct {
+        var ticks: u32 = 0;
+        // Minimal body by design: at the 4096 floor only ~3.8 KiB remains after
+        // the setup frame, and there is no guard page yet (C3).
+        fn work(_: *Fiber) void {
+            ticks += 1;
+            Fiber.yield();
+            ticks += 1;
+        }
+    };
+    S.ticks = 0;
+
+    const f = try Fiber.create(allocator, &S.work, .{ .stack_size = min_stack_size });
+    defer f.destroy();
+
+    while (f.state != .done) f.resumeFiber();
+    try std.testing.expectEqual(@as(u32, 2), S.ticks);
 }

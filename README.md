@@ -93,7 +93,8 @@ The `fiber` module exposes a single stackful fiber type.
 | Symbol | Signature | Description |
 | --- | --- | --- |
 | `Options` | `struct { stack_size: usize = 64*1024, data: ?*anyopaque = null }` | Options for `create` — stack size and an initial `data` payload. |
-| `Fiber.create` | `(allocator, entry, options: Options) !*Fiber` | Allocate a fiber and its stack. `options` sets the stack size and initial `data`. Pass `.{}` for defaults. Does not start it. |
+| `Fiber.create` | `(allocator, entry, options: Options) !*Fiber` | Allocate a fiber and its stack. `options` sets the stack size and initial `data`. Pass `.{}` for defaults. Returns `error.StackTooSmall` if `stack_size < min_stack_size`. Does not start it. |
+| `min_stack_size` | `usize` (`4096`) | The smallest `stack_size` `create` accepts — one page. A floor, not a recommendation. |
 | `Fiber.reset` | `(*Fiber, entry, data: ?*anyopaque) void` | Re-arm a finished (or never-started) fiber with a new entry and data, reusing its stack. The pooling primitive. |
 | `data` | `?*anyopaque` field | Per-fiber user payload; set via `Options` or directly, read in the entry via `fiber.data`. |
 | `Fiber.destroy` | `(*Fiber) void` | Free the fiber and its stack. |

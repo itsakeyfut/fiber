@@ -18,6 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Options` for `Fiber.create` (`stack_size`, `data`), a public `data`
   (`?*anyopaque`) field for per-fiber payloads, and `Fiber.reset` to re-arm a
   finished fiber for pool reuse without reallocating.
+- `min_stack_size` and a `create` check returning `error.StackTooSmall` for a
+  stack smaller than one page (a too-small stack previously corrupted the heap
+  during setup), plus a `destroy` precondition that the fiber must not be running.
 
 ### Changed
 
