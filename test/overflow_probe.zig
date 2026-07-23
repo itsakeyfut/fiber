@@ -6,6 +6,7 @@ fn recurse(depth: usize) void {
     buf[0] = @truncate(depth);
     std.mem.doNotOptimizeAway(&buf);
     recurse(depth + 1);
+    std.mem.doNotOptimizeAway(&buf); // keep the frame live past the call → not a tail call
 }
 
 fn overflow(_: *fiber.Fiber) void {
