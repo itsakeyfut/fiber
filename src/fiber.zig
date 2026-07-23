@@ -674,3 +674,27 @@ test "a created fiber's stack is page-aligned and page-rounded" {
     try std.testing.expect(f.stack.len % ps == 0);
     try std.testing.expect(f.stack.len >= min_stack_size);
 }
+
+test "a stack overflow faults on the guard page" {
+    const allocator = std.testing.allocator;
+
+    // The probe path is provided by build.zig when run via `zig build test`.
+    // This Zig's std.process has no getEnvVarOwned; std.testing.environ (set
+    // by the test runner from the process's real environment) is the current
+    // equivalent.
+    const probe = std.testing.environ.getAlloc(allocator, "FIBER_OVERFLOW_PROBE") catch return error.SkipZigTest;
+    defer allocator.free(probe);
+
+    var child = try std.process.spawn(std.testing.io, .{ .argv = &.{probe} });
+    const term = try child.wait(std.testing.io);
+
+    switch (term) {
+        // POSIX: the guard fault kills the process with a signal (SIGSEGV
+        // expected). The probe is fail-closed, so a signal can only be the guard.
+        .signal => {},
+        // Windows: an access violation terminates with a non-zero code. exit 0
+        // means the probe survived (or hit a setup error) → the guard did not fire.
+        .exited => |code| try std.testing.expect(code != 0),
+        else => return error.TestUnexpectedResult,
+    }
+}
