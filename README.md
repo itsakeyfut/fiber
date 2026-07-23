@@ -108,6 +108,12 @@ Each fiber allocates a stack — **64 KiB by default**, configurable via `Option
 own `*Fiber` so it can reach fiber-local data; returning from `entry` moves the fiber
 to `.done`, after which it must not be resumed again.
 
+Each fiber's stack has a no-access **guard page** immediately below it, so a
+stack overflow faults cleanly (SIGSEGV on Linux, an access violation on Windows)
+instead of silently corrupting adjacent memory. The stack is an OS mapping
+(`mmap`/`VirtualAlloc`); the allocator passed to `create` backs only the small
+`Fiber` struct. Guard-paged stacks require x86_64 Linux or Windows.
+
 Fibers are single-threaded: a fiber and the code that resumes it must run on the same
 OS thread. `current` is tracked per-thread, so nested resumes (a fiber resuming another
 fiber) restore the correct caller chain.
@@ -124,6 +130,10 @@ The context switch is implemented in per-target assembly:
 | Other architectures | Not supported |
 
 Unsupported targets fail at compile time with a clear message rather than miscompiling.
+
+Guard-paged stacks (and therefore `Fiber.create`) additionally require x86_64
+Linux or Windows — the BSD entries above describe the context switch only, not
+stack allocation.
 
 ## Testing
 
