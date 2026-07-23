@@ -6,8 +6,14 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       # fiber only supports x86_64 (System V ABI and Windows). GitHub's macOS
@@ -15,7 +21,7 @@ jobs:
       # intentionally omitted from the matrix.
       matrix:
         os: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+        optimize: [Debug, ReleaseSafe, ReleaseFast, ReleaseSmall]
     steps:
       - uses: actions/checkout@v4
 
@@ -24,7 +30,20 @@ jobs:
           version: 0.16.0
 
       - name: Build
-        run: zig build
+        run: zig build -Doptimize=${{ matrix.optimize }}
 
       - name: Test
-        run: zig build test
+        run: zig build test -Doptimize=${{ matrix.optimize }}
+
+  fmt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Format check
+        run: zig fmt --check .
