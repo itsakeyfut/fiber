@@ -196,17 +196,22 @@ test "FP control state is preserved across fiber switches" {
                     : [o] "=m" (v),
                 );
             }
-            return v;
+            // MXCSR only defines bits 0-15; bits 16-31 are reserved. Mask them off
+            // so a spurious high bit (observed from the "=m" output under optimized
+            // codegen on x86_64-linux) can never reach `ldmxcsr`, which raises #GP
+            // if any reserved bit is set.
+            return v & 0xffff;
         }
         fn setMxcsr(v: u32) void {
+            const clean = v & 0xffff; // never feed reserved bits to ldmxcsr (#GP)
             if (is_windows) {
-                var local = v;
+                var local = clean;
                 asm volatile ("ldmxcsr (%[i])"
                     :
                     : [i] "r" (&local),
                     : .{ .memory = true });
             } else {
-                const local = v;
+                const local = clean;
                 asm volatile ("ldmxcsr %[i]"
                     :
                     : [i] "m" (local),
