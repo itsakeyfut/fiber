@@ -9,4 +9,5 @@ pub const yield = fiber.Fiber.yield;
 test {
     @import("std").testing.refAllDecls(@This());
     _ = fiber;
+    _ = @import("stack.zig");
 }
