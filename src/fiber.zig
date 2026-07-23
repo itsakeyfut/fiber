@@ -34,6 +34,9 @@ pub const Fiber = struct {
     allocator: std.mem.Allocator,
     data: ?*anyopaque = null,
 
+    /// Allocate a fiber and its stack, ready to run `entry`; does not start it.
+    /// Returns `error.StackTooSmall` (before allocating) if
+    /// `options.stack_size < min_stack_size`.
     pub fn create(
         allocator: std.mem.Allocator,
         entry: *const fn (*Fiber) void,
@@ -70,7 +73,10 @@ pub const Fiber = struct {
         self.setupStack();
     }
 
+    /// Free the fiber and its stack. Must not be called on a `.running` fiber —
+    /// that frees the stack in use. `.ready`, `.suspended`, and `.done` are fine.
     pub fn destroy(self: *Fiber) void {
+        std.debug.assert(self.state != .running); // freeing a running stack is UB
         const allocator = self.allocator;
         allocator.free(self.stack);
         allocator.destroy(self);
@@ -80,6 +86,8 @@ pub const Fiber = struct {
         self.context.rsp = context.initStack(self.stack, &trampoline, &trampolineTrap);
     }
 
+    /// Switch into the fiber and run until it yields or finishes. The fiber must
+    /// be `.ready` or `.suspended` (never `.running` or `.done`).
     pub fn resumeFiber(self: *Fiber) void {
         std.debug.assert(self.state == .ready or self.state == .suspended);
 
@@ -95,6 +103,8 @@ pub const Fiber = struct {
         current = prev;
     }
 
+    /// Suspend the running fiber and switch back to its caller. Must be called
+    /// from within a running fiber; panics otherwise.
     pub fn yield() void {
         const self = current orelse @panic("yield() called outside of a fiber");
         self.state = .suspended;
